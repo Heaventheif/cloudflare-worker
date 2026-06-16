@@ -1,239 +1,247 @@
 /**
- * Cloudflare Worker — Proxy Server
- * ===================================================
- * يستقبل طلبات HTTP القادمة من HF Space ويمررها
- * للموقع المستهدف عبر شبكة Cloudflare النظيفة.
+ * yt-worker.js — Cloudflare Worker
+ * ══════════════════════════════════════════════════════════════
+ * يستقبل طلبات من HF Space ويوجّهها لـ YouTube بـ IP نظيف
  *
- * طريقة الرفع:
- *   1. اذهب إلى https://dash.cloudflare.com
- *   2. Workers & Pages → Create → Worker
- *   3. الصق هذا الكود → Deploy
- *   4. انسخ رابط الـ Worker مثال: https://proxy-abc.workers.dev
- *   5. ضعه في متغير البيئة CF_WORKER_URL داخل HF Space
+ * نشر Worker:
+ *   1. cloudflare.com → Workers & Pages → Create Worker
+ *   2. الصق هذا الكود → Deploy
+ *   3. انسخ الرابط: https://yt-proxy.YOUR-NAME.workers.dev
+ *   4. أضفه في HF Space Secrets:  CF_WORKER_URL = https://...
  *
- * حماية الـ Worker بـ Secret Token (اختياري لكن مُوصى به):
- *   - أضف متغير بيئة في Worker باسم: PROXY_SECRET
- *   - ضع نفس القيمة في HF Space باسم: CF_WORKER_SECRET
- * ===================================================
+ * Endpoints:
+ *   GET  /?url=<encoded_url>          ← proxy عام (للـ yt-dlp)
+ *   POST /yt/search?q=<query>&n=10    ← بحث YouTube
+ *   GET  /yt/info?v=<video_id>        ← معلومات فيديو
+ *   GET  /yt/stream?v=<id>&t=audio    ← رابط تحميل مباشر
+ * ══════════════════════════════════════════════════════════════
  */
 
-// ─── إعدادات قابلة للتعديل ──────────────────────────────────
-const CONFIG = {
-  // قائمة النطاقات المسموح بالوصول إليها (فارغة = الكل مسموح)
-  ALLOWED_DOMAINS: [],
-
-  // قائمة النطاقات المحظورة دائماً
-  BLOCKED_DOMAINS: [
-    "localhost",
-    "127.0.0.1",
-    "0.0.0.0",
-    "169.254.169.254", // AWS metadata
-    "metadata.google.internal",
-  ],
-
-  // الحد الأقصى لحجم الاستجابة (10 MB)
-  MAX_RESPONSE_SIZE: 10 * 1024 * 1024,
-
-  // مهلة الطلب بالميلي ثانية
-  REQUEST_TIMEOUT_MS: 30000,
-
-  // headers التي لا تُمرَّر للموقع المستهدف
-  STRIP_REQUEST_HEADERS: [
-    "cf-connecting-ip",
-    "cf-ipcountry",
-    "cf-ray",
-    "cf-visitor",
-    "cf-worker",
-    "x-forwarded-for",
-    "x-forwarded-proto",
-    "x-real-ip",
-    "host",
-  ],
-
-  // headers التي لا تُعاد للعميل
-  STRIP_RESPONSE_HEADERS: [
-    "content-encoding",
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "te",
-    "trailers",
-    "upgrade",
-  ],
-
-  // كلمة السر (يمكن تغييرها هنا مباشرة أو تركها فارغة)
-  PROXY_SECRET: "",
+// ─── headers تقليد متصفح حقيقي ───────────────────────────────
+const BROWSER_HEADERS = {
+  "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Encoding": "gzip, deflate, br",
+  "Sec-Fetch-Mode":  "navigate",
+  "Sec-Fetch-Site":  "none",
+  "Sec-Fetch-Dest":  "document",
+  "Sec-Ch-Ua":       '"Chromium";v="124", "Google Chrome";v="124"',
+  "Sec-Ch-Ua-Mobile":"?0",
+  "DNT":             "1",
 };
 
-// ─── Service Worker Format (متوافق مع جميع Workers) ─────────
-addEventListener("fetch", (event) => {
-  if (event.request.method === "OPTIONS") {
-    event.respondWith(corsPreflightResponse());
-    return;
-  }
-  event.respondWith(
-    handleRequest(event.request).catch(
-      (err) => jsonError(500, `Worker Error: ${err.message}`)
-    )
-  );
-});
+// ─── CORS headers ────────────────────────────────────────────
+const CORS = {
+  "Access-Control-Allow-Origin":  "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
 
-// ─── المعالج الرئيسي ─────────────────────────────────────────
-async function handleRequest(request) {
-  // 1. التحقق من الـ Secret Token إن كان مضبوطاً
-  const secret = CONFIG.PROXY_SECRET || (typeof PROXY_SECRET !== "undefined" ? PROXY_SECRET : "");
-  if (secret) {
-    const clientSecret = request.headers.get("X-Proxy-Secret") || "";
-    if (clientSecret !== secret) {
-      return jsonError(401, "Unauthorized: Invalid proxy secret.");
-    }
-  }
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", ...CORS },
+  });
+}
 
-  // 2. استخراج رابط الهدف من query param ?url=...
-  const { searchParams } = new URL(request.url);
-  const targetUrl = searchParams.get("url");
+// ════════════════════════════════════════════════════════════
+// 🔍  بحث YouTube — يجلب HTML صفحة النتائج ويحلّله
+// ════════════════════════════════════════════════════════════
+async function ytSearch(query, limit = 10) {
+  const searchUrl =
+    `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&hl=en`;
 
-  if (!targetUrl) {
-    return jsonError(400, "Missing required query parameter: ?url=<encoded_target_url>");
-  }
+  const res = await fetch(searchUrl, { headers: BROWSER_HEADERS });
+  if (!res.ok) throw new Error(`YouTube HTTP ${res.status}`);
 
-  // 3. التحقق من صحة الـ URL
-  let parsedUrl;
-  try {
-    parsedUrl = new URL(decodeURIComponent(targetUrl));
-  } catch (_) {
-    return jsonError(400, `Invalid target URL: ${targetUrl}`);
-  }
+  const html = await res.text();
 
-  // 4. فحص النطاقات المحظورة
-  const hostname = parsedUrl.hostname.toLowerCase();
-  for (const blocked of CONFIG.BLOCKED_DOMAINS) {
-    if (hostname === blocked || hostname.endsWith(`.${blocked}`)) {
-      return jsonError(403, `Forbidden: Domain '${hostname}' is blocked.`);
-    }
-  }
+  // yt_initial_data يحتوي كل نتائج البحث كـ JSON
+  const match = html.match(/var ytInitialData\s*=\s*(\{.+?\});\s*<\/script>/s);
+  if (!match) throw new Error("ytInitialData غير موجود في الصفحة");
 
-  // 5. فحص النطاقات المسموحة (إن كانت القائمة غير فارغة)
-  if (CONFIG.ALLOWED_DOMAINS.length > 0) {
-    const isAllowed = CONFIG.ALLOWED_DOMAINS.some(
-      (d) => hostname === d || hostname.endsWith(`.${d}`)
-    );
-    if (!isAllowed) {
-      return jsonError(403, `Forbidden: Domain '${hostname}' is not in the allowed list.`);
-    }
-  }
+  const data = JSON.parse(match[1]);
 
-  // 6. بناء الـ headers النظيفة للطلب الخارجي
-  const outboundHeaders = new Headers();
+  // مسار البيانات داخل ytInitialData
+  const contents =
+    data?.contents
+      ?.twoColumnSearchResultsRenderer
+      ?.primaryContents
+      ?.sectionListRenderer
+      ?.contents?.[0]
+      ?.itemSectionRenderer
+      ?.contents || [];
 
-  for (const [key, value] of request.headers.entries()) {
-    const lowerKey = key.toLowerCase();
-    if (!CONFIG.STRIP_REQUEST_HEADERS.includes(lowerKey) && !lowerKey.startsWith("cf-")) {
-      outboundHeaders.set(key, value);
-    }
-  }
+  const results = [];
+  for (const item of contents) {
+    const v = item?.videoRenderer;
+    if (!v || !v.videoId) continue;
 
-  outboundHeaders.set("Host", parsedUrl.host);
+    const durationText =
+      v.lengthText?.simpleText ||
+      v.lengthText?.accessibility?.accessibilityData?.label || "";
 
-  if (!outboundHeaders.has("User-Agent")) {
-    outboundHeaders.set(
-      "User-Agent",
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"
-    );
-  }
-  if (!outboundHeaders.has("Accept")) {
-    outboundHeaders.set(
-      "Accept",
-      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-    );
-  }
-  if (!outboundHeaders.has("Accept-Language")) {
-    outboundHeaders.set("Accept-Language", "en-US,en;q=0.9");
-  }
-
-  // 7. إعداد جسم الطلب (للـ POST)
-  let requestBody = null;
-  if (request.method !== "GET" && request.method !== "HEAD") {
-    requestBody = await request.arrayBuffer();
-  }
-
-  // 8. إرسال الطلب للموقع المستهدف مع timeout
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT_MS);
-
-  let targetResponse;
-  try {
-    targetResponse = await fetch(parsedUrl.toString(), {
-      method: request.method,
-      headers: outboundHeaders,
-      body: requestBody,
-      signal: controller.signal,
-      redirect: "follow",
+    results.push({
+      id:       v.videoId,
+      title:    v.title?.runs?.[0]?.text || "بدون عنوان",
+      url:      `https://www.youtube.com/watch?v=${v.videoId}`,
+      duration: durationText,
+      uploader: v.ownerText?.runs?.[0]?.text || v.shortBylineText?.runs?.[0]?.text || "",
+      views:    v.viewCountText?.simpleText || "",
+      thumb:    `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
     });
-  } catch (err) {
-    clearTimeout(timeoutId);
-    if (err.name === "AbortError") {
-      return jsonError(504, `Gateway Timeout: Target did not respond within ${CONFIG.REQUEST_TIMEOUT_MS}ms`);
-    }
-    return jsonError(502, `Bad Gateway: ${err.message}`);
-  } finally {
-    clearTimeout(timeoutId);
+
+    if (results.length >= limit) break;
   }
 
-  // 9. قراءة جسم الاستجابة
-  const responseBuffer = await targetResponse.arrayBuffer();
+  return results;
+}
 
-  if (responseBuffer.byteLength > CONFIG.MAX_RESPONSE_SIZE) {
-    return jsonError(413, `Response too large: ${responseBuffer.byteLength} bytes (max: ${CONFIG.MAX_RESPONSE_SIZE})`);
+// ════════════════════════════════════════════════════════════
+// ℹ️  معلومات فيديو — يجلب صفحة الفيديو ويحلّلها
+// ════════════════════════════════════════════════════════════
+async function ytInfo(videoId) {
+  const url = `https://www.youtube.com/watch?v=${videoId}&hl=en`;
+  const res = await fetch(url, { headers: BROWSER_HEADERS });
+  if (!res.ok) throw new Error(`YouTube HTTP ${res.status}`);
+
+  const html = await res.text();
+  const match = html.match(/var ytInitialData\s*=\s*(\{.+?\});\s*<\/script>/s);
+  if (!match) throw new Error("ytInitialData غير موجود");
+
+  const data = JSON.parse(match[1]);
+  const vd =
+    data?.contents
+      ?.twoColumnWatchNextResults
+      ?.results
+      ?.results
+      ?.contents?.[0]
+      ?.videoPrimaryInfoRenderer;
+
+  const vd2 =
+    data?.contents
+      ?.twoColumnWatchNextResults
+      ?.results
+      ?.results
+      ?.contents?.[1]
+      ?.videoSecondaryInfoRenderer;
+
+  return {
+    id:          videoId,
+    title:       vd?.title?.runs?.[0]?.text || "",
+    views:       vd?.viewCount?.videoViewCountRenderer?.viewCount?.simpleText || "",
+    uploadDate:  vd?.dateText?.simpleText || "",
+    uploader:    vd2?.owner?.videoOwnerRenderer?.title?.runs?.[0]?.text || "",
+    url:         `https://www.youtube.com/watch?v=${videoId}`,
+  };
+}
+
+// ════════════════════════════════════════════════════════════
+// 🌐  Proxy عام — يمرّر أي URL عبر الـ Worker
+// يستخدمه yt-dlp عبر --proxy أو مباشرة
+// ════════════════════════════════════════════════════════════
+async function proxyUrl(targetUrl, originalRequest) {
+  // أعد بناء الـ headers مع إزالة headers الـ Worker
+  const headers = new Headers(BROWSER_HEADERS);
+
+  // أضف headers مخصصة من الطلب الأصلي إذا احتجنا
+  const contentType = originalRequest.headers.get("content-type");
+  if (contentType) headers.set("content-type", contentType);
+
+  const init = {
+    method:  originalRequest.method,
+    headers,
+    redirect: "follow",
+  };
+
+  // مرّر الـ body لطلبات POST
+  if (["POST", "PUT", "PATCH"].includes(originalRequest.method)) {
+    init.body = await originalRequest.arrayBuffer();
   }
 
-  // 10. بناء headers الاستجابة المرجعة للعميل
-  const responseHeaders = new Headers();
+  const res = await fetch(targetUrl, init);
 
-  for (const [key, value] of targetResponse.headers.entries()) {
-    const lowerKey = key.toLowerCase();
-    if (!CONFIG.STRIP_RESPONSE_HEADERS.includes(lowerKey)) {
-      responseHeaders.set(key, value);
-    }
-  }
+  // أعد بناء Response مع CORS headers
+  const resHeaders = new Headers(res.headers);
+  Object.entries(CORS).forEach(([k, v]) => resHeaders.set(k, v));
+  // مهم: أزل header الأمان الذي يمنع iframe
+  resHeaders.delete("x-frame-options");
+  resHeaders.delete("content-security-policy");
 
-  responseHeaders.set("Access-Control-Allow-Origin", "*");
-  responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD");
-  responseHeaders.set("Access-Control-Allow-Headers", "*");
-  responseHeaders.set("Access-Control-Expose-Headers", "*");
-  responseHeaders.set("X-Proxy-Status", "success");
-  responseHeaders.set("X-Proxied-URL", parsedUrl.toString());
-  responseHeaders.set("X-Original-Status", String(targetResponse.status));
-
-  return new Response(responseBuffer, {
-    status: targetResponse.status,
-    statusText: targetResponse.statusText,
-    headers: responseHeaders,
+  return new Response(res.body, {
+    status:  res.status,
+    headers: resHeaders,
   });
 }
 
-// ─── دوال مساعدة ─────────────────────────────────────────────
-function jsonError(status, message) {
-  return new Response(
-    JSON.stringify({ error: true, status, message }),
-    {
-      status,
-      headers: {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Origin": "*",
-      },
-    }
-  );
-}
+// ════════════════════════════════════════════════════════════
+// Router الرئيسي
+// ════════════════════════════════════════════════════════════
+export default {
+  async fetch(request, env, ctx) {
+    const url    = new URL(request.url);
+    const path   = url.pathname;
+    const method = request.method;
 
-function corsPreflightResponse() {
-  return new Response(null, {
-    status: 204,
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
-      "Access-Control-Allow-Headers": "*",
-      "Access-Control-Max-Age": "86400",
-    },
-  });
-}
+    // OPTIONS (CORS preflight)
+    if (method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS });
+    }
+
+    try {
+
+      // ── /yt/search?q=...&n=10 ──────────────────────────
+      if (path === "/yt/search") {
+        const q = url.searchParams.get("q") || "";
+        const n = Math.min(parseInt(url.searchParams.get("n") || "10"), 15);
+        if (!q) return json({ error: "q مطلوب" }, 400);
+
+        const results = await ytSearch(q, n);
+        return json({ results });
+      }
+
+      // ── /yt/info?v=VIDEO_ID ───────────────────────────
+      if (path === "/yt/info") {
+        const v = url.searchParams.get("v") || "";
+        if (!v) return json({ error: "v مطلوب" }, 400);
+
+        const info = await ytInfo(v);
+        return json(info);
+      }
+
+      // ── /?url=<encoded> — proxy عام ───────────────────
+      const targetUrl = url.searchParams.get("url");
+      if (targetUrl) {
+        // تحقق أن الرابط مسموح (YouTube فقط للأمان)
+        const allowed = [
+          "youtube.com", "youtu.be", "googlevideo.com",
+          "ytimg.com", "ggpht.com", "googleusercontent.com",
+          "googleapis.com",
+        ];
+        const targetHost = new URL(targetUrl).hostname;
+        const ok = allowed.some(d => targetHost === d || targetHost.endsWith(`.${d}`));
+        if (!ok) return json({ error: "الدومين غير مسموح" }, 403);
+
+        return await proxyUrl(targetUrl, request);
+      }
+
+      // ── / — صفحة الحالة ──────────────────────────────
+      if (path === "/" && !targetUrl) {
+        return json({
+          status:    "✅ yt-worker يعمل",
+          endpoints: [
+            "GET  /?url=<encoded_url>       ← proxy عام",
+            "GET  /yt/search?q=...&n=10     ← بحث",
+            "GET  /yt/info?v=VIDEO_ID        ← معلومات فيديو",
+          ],
+        });
+      }
+
+      return json({ error: "مسار غير موجود" }, 404);
+
+    } catch (err) {
+      return json({ error: err.message || "خطأ داخلي" }, 500);
+    }
+  },
+};
